@@ -5,14 +5,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-OMIT = frozenset("qx")
+OMIT = frozenset("q")
 SENTINEL = "^"
 text_path = "input.txt"
 context_len = 3
-dims = [2, 4, 8, 16, 32]
-epochs = 40
-batch_size = 512
-lr = 0.01
+dim = 4
+epochs = 30
+batch_size = 128
+lr = 0.006
 val_fraction = 0.1
 seed = 1
 random.seed(seed)
@@ -116,6 +116,16 @@ def make_examples(stream, context_len, char_to_idx):
         raise ValueError("No training examples were created from the input text.")
     return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
+def split_examples(x, y, val_fraction, seed):
+    n = x.size(0)
+    indices = list(range(n))
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    n_val = max(1, int(n * val_fraction))
+    val_idx = torch.tensor(indices[:n_val], dtype=torch.long)
+    train_idx = torch.tensor(indices[n_val:], dtype=torch.long)
+    return x[train_idx], y[train_idx], x[val_idx], y[val_idx]
+
 def expected_rank_loss(logits, targets, sentinel_idx):
     batch = logits.size(0)
     vocab = logits.size(1)
@@ -129,7 +139,9 @@ def expected_rank_loss(logits, targets, sentinel_idx):
     target_valid = full_to_valid[targets]
     target_scores = valid_logits[torch.arange(batch, device=logits.device), target_valid].unsqueeze(1)
     margins = valid_logits - target_scores
-    loss = torch.sigmoid(margins).sum(dim=1) - torch.sigmoid(torch.zeros(1, device=logits.device))
+    self_mask = torch.ones_like(margins, dtype=torch.bool)
+    self_mask[torch.arange(batch, device=logits.device), target_valid] = False
+    loss = (torch.sigmoid(margins) * self_mask).sum(dim=1)
     return loss.mean()
 
 class CharOrderModel(nn.Module):
@@ -173,53 +185,47 @@ class CharOrderModel(nn.Module):
         return state_bytes
 
 def train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, seed):
-    generator = torch.Generator().manual_seed(seed)
-    train_loader = DataLoader(
-        TensorDataset(train_x, train_y),
-        batch_size=batch_size,
-        shuffle=True,
-        generator=generator,
-    )
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     best_state = None
     best_val = math.inf
+    n = train_x.size(0)
+    rng = torch.Generator().manual_seed(seed)
     for epoch in range(1, epochs + 1):
         model.train()
+        perm = torch.randperm(n, generator=rng)
         total_loss = 0.0
-        total_seen = 0
-        for xb, yb in train_loader:
+        for start in range(0, n, batch_size):
+            idx = perm[start:start + batch_size]
+            xb, yb = train_x[idx], train_y[idx]
             opt.zero_grad(set_to_none=True)
             logits = model(xb)
             loss = expected_rank_loss(logits, yb, model.sentinel_idx)
             loss.backward()
             opt.step()
             total_loss += loss.item() * xb.size(0)
-            total_seen += xb.size(0)
-        train_loss = total_loss / max(total_seen, 1)
+        train_loss = total_loss / n
         val_loss = evaluate_rank_loss(model, val_x, val_y, batch_size)
         if val_loss < best_val:
             best_val = val_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        print(f"  epoch {epoch:02d}  train={train_loss:.4f}  val={val_loss:.4f}")
+        print(f"  epoch {epoch:02d}  train {train_loss:.4f}  val {val_loss:.4f}")
     if best_state is not None:
         model.load_state_dict(best_state)
     return model
 
 def evaluate_rank_loss(model, x, y, batch_size):
-    loader = DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
     model.eval()
     total_loss = 0.0
-    total_seen = 0
+    n = x.size(0)
     with torch.no_grad():
-        for xb, yb in loader:
+        for start in range(0, n, batch_size):
+            xb, yb = x[start:start + batch_size], y[start:start + batch_size]
             logits = model(xb)
             loss = expected_rank_loss(logits, yb, model.sentinel_idx)
             total_loss += loss.item() * xb.size(0)
-            total_seen += xb.size(0)
-    return total_loss / max(total_seen, 1)
+    return total_loss / max(n, 1)
 
 def evaluate_rotations(model, x, y, idx_to_char, char_to_idx, batch_size):
-    loader = DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
     valid_indices = [i for i in range(len(idx_to_char)) if i != char_to_idx[SENTINEL]]
     valid_indices_t = torch.tensor(valid_indices, dtype=torch.long)
     full_to_valid = torch.full((len(idx_to_char),), -1, dtype=torch.long)
@@ -227,9 +233,10 @@ def evaluate_rotations(model, x, y, idx_to_char, char_to_idx, batch_size):
         full_to_valid[idx] = pos
     model.eval()
     total_cost = 0
-    total_seen = 0
+    n = x.size(0)
     with torch.no_grad():
-        for xb, yb in loader:
+        for start in range(0, n, batch_size):
+            xb, yb = x[start:start + batch_size], y[start:start + batch_size]
             logits = model(xb)
             valid_logits = logits.index_select(1, valid_indices_t.to(logits.device))
             order = torch.argsort(valid_logits, dim=1, descending=True)
@@ -239,26 +246,8 @@ def evaluate_rotations(model, x, y, idx_to_char, char_to_idx, batch_size):
             target_cols = full_to_valid[yb].to(order.device)
             target_pos = positions.gather(1, target_cols.unsqueeze(1)).squeeze(1)
             total_cost += int(target_pos.sum().item())
-            total_seen += xb.size(0)
-    avg = total_cost / total_seen if total_seen else 0.0
-    return total_cost, total_seen, avg
-
-def run_dim_sweep(dims, alphabet, char_to_idx, idx_to_char, train_x, train_y, val_x, val_y, val_stream, context_len, epochs, batch_size, lr, seed, static_avg, oracle_avg,):
-    print(f"\n{'dim':>5}  {'rotations/char':>14}  {'vs static':>10}  {'vs oracle':>10}  {'flash B':>10}  {'runtime B':>10}")
-    print("-" * 67)
-    results = []
-    for dim in dims:
-        model = CharOrderModel(len(alphabet), dim, context_len, char_to_idx[SENTINEL])
-        print(f"\ndim={dim}")
-        model = train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, seed)
-        cost, chars, avg = evaluate_rotations(model, val_x, val_y, idx_to_char, char_to_idx, batch_size)
-        flash = model.parameter_bytes()
-        runtime = model.runtime_bytes()
-        vs_static = static_avg - avg
-        vs_oracle = oracle_avg - avg
-        results.append((dim, avg, flash, runtime))
-        print(f"\n{dim:>5}  {avg:>14.4f}  {vs_static:>+10.4f}  {vs_oracle:>+10.4f}  {flash:>10}  {runtime:>10}")
-    return results
+    avg = total_cost / n if n else 0.0
+    return total_cost, n, avg
 
 def main():
     with open(text_path, encoding="utf-8") as f:
@@ -267,42 +256,32 @@ def main():
     alphabet, char_to_idx, idx_to_char = build_vocab(stream)
     if len(alphabet) <= 2:
         raise ValueError("The input text does not contain enough characters after normalization.")
-    split = max(int(len(stream) * (1 - val_fraction)), context_len + 1)
-    split = min(split, len(stream) - 1)
-    train_stream = stream[:split]
-    val_stream = stream[split - context_len:]
-    train_x, train_y = make_examples(train_stream, context_len, char_to_idx)
-    val_x, val_y = make_examples(val_stream, context_len, char_to_idx)
-    global_order = build_global_freq(train_stream, alphabet)
-    counts = build_ngram_counts([SENTINEL] * context_len + train_stream, context_len)
+    all_x, all_y = make_examples(stream, context_len, char_to_idx)
+    train_x, train_y, val_x, val_y = split_examples(all_x, all_y, val_fraction, seed)
+    global_order = build_global_freq(stream, alphabet)
+    counts = build_ngram_counts([SENTINEL] * context_len + stream, context_len)
     static_fn = static_reorder(global_order)
     oracle_fn = make_oracle(counts, global_order, context_len)
-    static_cost, static_chars, static_avg = simulate(val_stream, alphabet, static_fn, context_len)
-    oracle_cost, oracle_chars, oracle_avg = simulate(val_stream, alphabet, oracle_fn, context_len)
-    print(f"Alphabet size:      {len(alphabet) - 1}")
-    print(f"Context length:     {context_len}")
-    print(f"Train examples:     {len(train_x)}")
-    print(f"Validation examples:{len(val_x)}")
-    print(f"Static baseline:    {static_avg:.4f} rotations/char")
-    print(f"Oracle {context_len}-gram:     {oracle_avg:.4f} rotations/char")
-    results = run_dim_sweep( dims, alphabet, char_to_idx, idx_to_char, train_x, train_y, val_x, val_y, val_stream, context_len, epochs, batch_size, lr, seed, static_avg, oracle_avg,)
-    print("\n\nDimension sweep summary:")
-    print(f"{'dim':>5}  {'rotations/char':>14}  {'flash B':>10}  {'runtime B':>10}")
-    print("-" * 45)
-    for dim, avg, flash, runtime in results:
-        print(f"{dim:>5}  {avg:>14.4f}  {flash:>10}  {runtime:>10}")
-    print(f"\nStatic baseline: {static_avg:.4f}")
-    print(f"Oracle {context_len}-gram:  {oracle_avg:.4f}")
-    best_dim = min(results, key=lambda r: r[1])[0]
-    print(f"\nBest dim by rotations/char: {best_dim}")
-    model = CharOrderModel(len(alphabet), best_dim, context_len, char_to_idx[SENTINEL])
+    static_cost, static_chars, static_avg = simulate(stream, alphabet, static_fn, context_len)
+    oracle_cost, oracle_chars, oracle_avg = simulate(stream, alphabet, oracle_fn, context_len)
+    print(f"Alphabet: {''.join(global_order)}")
+    print(f"Alphabet size:       {len(alphabet) - 1}")
+    print(f"Context length:      {context_len}")
+    print(f"Dim:                 {dim}")
+    print(f"Train examples:      {len(train_x)}")
+    print(f"Validation examples: {len(val_x)}")
+    print(f"Static baseline:     {static_avg:.4f} rotations/char")
+    print(f"Oracle {context_len}-gram:       {oracle_avg:.4f} rotations/char")
+    model = CharOrderModel(len(alphabet), dim, context_len, char_to_idx[SENTINEL])
     model = train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, seed)
-    sample = val_stream[:context_len + 12]
-    if len(sample) >= context_len:
-        context = sample[:context_len]
-        ordering = model.predict_ordering([char_to_idx[c] for c in context], idx_to_char)
-        print(f"\nSample context (best dim={best_dim}): {''.join(context)}")
-        print(f"Top 10 predictions: {''.join(ordering[:10])}")
+    cost, chars, avg = evaluate_rotations(model, val_x, val_y, idx_to_char, char_to_idx, batch_size)
+    print(f"\nVal rotations/char:  {avg:.4f}  (vs static {static_avg - avg:+.4f}, vs oracle {oracle_avg - avg:+.4f})")
+    print(f"Flash bytes:         {model.parameter_bytes()}")
+    print(f"Runtime bytes:       {model.runtime_bytes()}")
+    sample_ctx = [idx_to_char[i.item()] for i in val_x[0]]
+    ordering = model.predict_ordering(val_x[0].tolist(), idx_to_char)
+    print(f"\nSample context: {''.join(sample_ctx)}")
+    print(f"Top 10 predictions: {''.join(ordering[:10])}")
 
 if __name__ == "__main__":
     main()

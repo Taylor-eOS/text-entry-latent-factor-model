@@ -10,9 +10,9 @@ SENTINEL = "^"
 text_path = "input.txt"
 context_len = 3
 dim = 4
-epochs = 30
+epochs = 80
 batch_size = 128
-lr = 0.006
+lr = 0.007
 val_fraction = 0.1
 seed = 1
 random.seed(seed)
@@ -150,25 +150,20 @@ class CharOrderModel(nn.Module):
         self.context_len = context_len
         self.sentinel_idx = sentinel_idx
         self.char_emb = nn.Embedding(vocab_size, dim)
-        self.pos_emb = nn.Embedding(context_len, dim)
-        self.mix = nn.Linear(dim, dim, bias=False)
         self.output_emb = nn.Embedding(vocab_size, dim)
         self.output_bias = nn.Parameter(torch.zeros(vocab_size))
-        nn.init.eye_(self.mix.weight)
-
+        self.register_buffer('pos_coeffs', torch.linspace(0.5, 1.5, context_len).view(1, context_len, 1))
     def forward(self, x):
         if x.dim() == 1:
             x = x.unsqueeze(0)
-        pos_ids = torch.arange(self.context_len, device=x.device)
         char_vecs = self.char_emb(x)
-        pos_vecs = self.pos_emb(pos_ids).unsqueeze(0)
-        state = (char_vecs + pos_vecs).sum(dim=1)
-        state = self.mix(state)
-        logits = state @ self.output_emb.weight.t() + self.output_bias
-        logits = logits.clone()
+        weighted = char_vecs * self.pos_coeffs
+        state = weighted.sum(dim=1)
+        state_norm = state / (state.norm(dim=1, keepdim=True) + 1e-8)
+        out_norm = self.output_emb.weight / (self.output_emb.weight.norm(dim=1, keepdim=True) + 1e-8)
+        logits = (state_norm @ out_norm.t()) * 10.0 + self.output_bias
         logits[:, self.sentinel_idx] = -1e9
         return logits
-
     def predict_ordering(self, context_ids, idx_to_char):
         device = next(self.parameters()).device
         x = torch.tensor(context_ids, dtype=torch.long, device=device)
@@ -176,16 +171,15 @@ class CharOrderModel(nn.Module):
             logits = self.forward(x).squeeze(0)
             order = torch.argsort(logits, descending=True).tolist()
         return [idx_to_char[i] for i in order if i != self.sentinel_idx]
-
     def parameter_bytes(self):
         return sum(p.numel() for p in self.parameters()) * 4
-
     def runtime_bytes(self):
         state_bytes = (self.char_emb.embedding_dim) * 4
         return state_bytes
 
 def train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, seed):
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs)
     best_state = None
     best_val = math.inf
     n = train_x.size(0)
@@ -201,8 +195,10 @@ def train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, s
             logits = model(xb)
             loss = expected_rank_loss(logits, yb, model.sentinel_idx)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             total_loss += loss.item() * xb.size(0)
+        scheduler.step()
         train_loss = total_loss / n
         val_loss = evaluate_rank_loss(model, val_x, val_y, batch_size)
         if val_loss < best_val:
@@ -281,7 +277,7 @@ def main():
     sample_ctx = [idx_to_char[i.item()] for i in val_x[0]]
     ordering = model.predict_ordering(val_x[0].tolist(), idx_to_char)
     print(f"\nSample context: {''.join(sample_ctx)}")
-    print(f"Top 10 predictions: {''.join(ordering[:10])}")
+    print(f"Predictions: {''.join(ordering)}")
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,5 @@
 from collections import defaultdict, Counter
+from math import log2
 
 OMIT = frozenset('qx')
 
@@ -98,6 +99,56 @@ def kendall_distance(a, b):
                 inv += 1
     return inv
 
+def entropy_from_counter(counter):
+    total = sum(counter.values())
+    if total == 0:
+        return 0.0
+    h = 0.0
+    for count in counter.values():
+        p = count / total
+        h -= p * log2(p)
+    return h
+
+def percentile(values, p):
+    if not values:
+        return 0
+    values = sorted(values)
+    idx = int((len(values) - 1) * p)
+    return values[idx]
+
+def analyze_prediction(stream, oracle_fn, order):
+    ranks = []
+    top1 = 0
+    top3 = 0
+    top5 = 0
+    top8 = 0
+    total = 0
+    for i in range(len(stream)):
+        ch = stream[i]
+        start = max(0, i - order)
+        context = stream[start:i]
+        ordering = oracle_fn(context)
+        try:
+            rank = ordering.index(ch)
+        except ValueError:
+            rank = len(ordering)
+        ranks.append(rank)
+        top1 += rank < 1
+        top3 += rank < 3
+        top5 += rank < 5
+        top8 += rank < 8
+        total += 1
+    mean_rank = sum(ranks) / len(ranks) if ranks else 0
+    print("True next-letter rank:")
+    print(f"  mean   : {mean_rank:.3f}")
+    print(f"  median : {percentile(ranks, 0.5)}")
+    print(f"  p95    : {percentile(ranks, 0.95)}")
+    print("Top-k accuracy:")
+    print(f"  top-1 : {100.0 * top1 / total:.2f}%")
+    print(f"  top-3 : {100.0 * top3 / total:.2f}%")
+    print(f"  top-5 : {100.0 * top5 / total:.2f}%")
+    print(f"  top-8 : {100.0 * top8 / total:.2f}%")
+
 def analyze_oracle(stream, oracle_fn, global_order, order):
     table = build_oracle_table(stream, oracle_fn, order)
     print(f"=== Oracle analysis (order={order}) ===")
@@ -140,6 +191,29 @@ def analyze_oracle(stream, oracle_fn, global_order, order):
                 total += 1
         agreement = 100.0 * matches / total if total else 0
         print(f"  top-{k:<2}: {agreement:.2f}%")
+    print("Top-N divergence from global ordering:")
+    for k in [3, 5, 8, 10]:
+        diff_sum = 0
+        hist = Counter()
+        for ordering in table.values():
+            limit = min(k, len(ordering), len(global_order))
+            diff = sum(1 for i in range(limit) if ordering[i] != global_order[i])
+            diff_sum += diff
+            hist[diff] += 1
+        avg_diff = diff_sum / len(table)
+        print(f"  top-{k}: avg differing positions = {avg_diff:.3f}")
+        for diff in sorted(hist):
+            pct = 100.0 * hist[diff] / len(table)
+            print(f"    {diff} differences: {pct:.2f}%")
+    print("Top-N membership changes:")
+    for k in [3, 5, 8, 10]:
+        changes = []
+        global_top = set(global_order[:k])
+        for ordering in table.values():
+            oracle_top = set(ordering[:k])
+            changes.append(len(oracle_top.symmetric_difference(global_top)) // 2)
+        avg_changes = sum(changes) / len(changes)
+        print(f"  top-{k}: avg letters replaced = {avg_changes:.3f}")
     distances = []
     for ordering in table.values():
         filtered = [ch for ch in ordering if ch in global_pos]
@@ -149,6 +223,7 @@ def analyze_oracle(stream, oracle_fn, global_order, order):
     max_distance = alphabet_size * (alphabet_size - 1) // 2
     print(f"Average Kendall distance: {mean_distance:.2f}")
     print(f"Normalized Kendall distance: {100.0 * mean_distance / max_distance:.2f}%")
+    print(f"Average adjacent swaps from global ordering: {mean_distance:.2f}")
     first_letters = Counter()
     for ordering in table.values():
         if ordering:
@@ -166,6 +241,16 @@ def analyze_oracle(stream, oracle_fn, global_order, order):
     for ch, count in top5_letters.most_common(10):
         pct = 100.0 * count / total_slots
         print(f"  {repr(ch):>3} : {pct:6.2f}%")
+    position_counts = defaultdict(Counter)
+    max_pos = min(10, alphabet_size)
+    for ordering in table.values():
+        for pos in range(max_pos):
+            position_counts[pos][ordering[pos]] += 1
+    print("Positional entropy:")
+    for pos in range(max_pos):
+        h = entropy_from_counter(position_counts[pos])
+        eff = 2 ** h
+        print(f"  pos {pos + 1:2d}: {h:.3f} bits, effective choices {eff:.2f}")
 
 def main():
     with open('input.txt', encoding='utf-8') as f:
@@ -186,6 +271,7 @@ def main():
         _, _, oracle_avg = simulate(stream, set(alphabet), oracle_fn, order)
         reduction = 100 * (1 - oracle_avg / static_avg)
         print(f"Oracle (max order={order}):         {oracle_avg:.4f} avg rotations/char  ({reduction:.1f}% reduction)")
+        analyze_prediction(stream, oracle_fn, order)
         analyze_oracle(stream, oracle_fn, global_order, order)
 
 if __name__ == '__main__':

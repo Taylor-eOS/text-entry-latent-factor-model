@@ -3,13 +3,13 @@ import random
 from collections import defaultdict
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
 
 OMIT = frozenset("q")
 SENTINEL = "^"
 text_path = "input.txt"
 context_len = 3
-dim = 4
+dim = 8
 epochs = 80
 batch_size = 128
 lr = 0.007
@@ -17,6 +17,7 @@ val_fraction = 0.1
 seed = 1
 random.seed(seed)
 torch.manual_seed(seed)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def normalize(raw, omit=OMIT):
     out = []
@@ -38,6 +39,14 @@ def build_vocab(stream):
     idx_to_char = {i: ch for ch, i in char_to_idx.items()}
     return alphabet, char_to_idx, idx_to_char
 
+def build_global_freq(stream, alphabet):
+    freq = defaultdict(int)
+    for ch in stream:
+        if ch in alphabet and ch != SENTINEL:
+            freq[ch] += 1
+    total = sum(freq.values()) or 1
+    return sorted([ch for ch in alphabet if ch != SENTINEL], key=lambda c: -freq[c] / total)
+
 def build_ngram_counts(stream, max_order):
     counts = {}
     for order in range(1, max_order + 1):
@@ -51,14 +60,6 @@ def build_ngram_counts(stream, max_order):
             ctx = tuple(stream[start:i + 1])
             counts[order][ctx][nxt] += 1
     return counts
-
-def build_global_freq(stream, alphabet):
-    freq = defaultdict(int)
-    for ch in stream:
-        if ch in alphabet and ch != SENTINEL:
-            freq[ch] += 1
-    total = sum(freq.values()) or 1
-    return sorted([ch for ch in alphabet if ch != SENTINEL], key=lambda c: -freq[c] / total)
 
 def make_oracle(counts, global_order, max_order):
     def reorder(context):
@@ -83,7 +84,7 @@ def simulate(stream, alphabet, reorder_fn, context_len):
     total_chars = 0
     padding = [SENTINEL] * context_len
     padded = padding + stream
-    candidate_set = [ch for ch in alphabet if ch != SENTINEL]
+    candidate_set = {ch for ch in alphabet if ch != SENTINEL}
     for i in range(context_len, len(padded)):
         ch = padded[i]
         if ch not in candidate_set:
@@ -99,10 +100,17 @@ def simulate(stream, alphabet, reorder_fn, context_len):
     avg = total_cost / total_chars if total_chars else 0.0
     return total_cost, total_chars, avg
 
+def ctx_to_id(ctx, char_to_idx, base, context_len):
+    out = 0
+    for ch in ctx:
+        out = out * base + char_to_idx[ch]
+    return out
+
 def make_examples(stream, context_len, char_to_idx):
     padded = [SENTINEL] * context_len + stream
     x = []
     y = []
+    base = len(char_to_idx)
     for i in range(context_len, len(padded)):
         tgt = padded[i]
         if tgt not in char_to_idx:
@@ -110,7 +118,7 @@ def make_examples(stream, context_len, char_to_idx):
         ctx = padded[i - context_len:i]
         if any(ch not in char_to_idx for ch in ctx):
             continue
-        x.append([char_to_idx[ch] for ch in ctx])
+        x.append(ctx_to_id(ctx, char_to_idx, base, context_len))
         y.append(char_to_idx[tgt])
     if not x:
         raise ValueError("No training examples were created from the input text.")
@@ -126,47 +134,24 @@ def split_examples(x, y, val_fraction, seed):
     train_idx = torch.tensor(indices[n_val:], dtype=torch.long)
     return x[train_idx], y[train_idx], x[val_idx], y[val_idx]
 
-def expected_rank_loss(logits, targets, sentinel_idx):
-    batch = logits.size(0)
-    vocab = logits.size(1)
-    mask = torch.ones(vocab, dtype=torch.bool, device=logits.device)
-    mask[sentinel_idx] = False
-    valid_logits = logits[:, mask]
-    valid_size = valid_logits.size(1)
-    full_to_valid = torch.full((vocab,), -1, dtype=torch.long, device=logits.device)
-    valid_indices = torch.where(mask)[0]
-    full_to_valid[valid_indices] = torch.arange(valid_size, device=logits.device)
-    target_valid = full_to_valid[targets]
-    target_scores = valid_logits[torch.arange(batch, device=logits.device), target_valid].unsqueeze(1)
-    margins = valid_logits - target_scores
-    self_mask = torch.ones_like(margins, dtype=torch.bool)
-    self_mask[torch.arange(batch, device=logits.device), target_valid] = False
-    loss = (torch.sigmoid(margins) * self_mask).sum(dim=1)
-    return loss.mean()
-
-class CharOrderModel(nn.Module):
-    def __init__(self, vocab_size, dim, context_len, sentinel_idx):
+class ContextFactorModel(nn.Module):
+    def __init__(self, num_contexts, dim, vocab_size, sentinel_idx):
         super().__init__()
-        self.context_len = context_len
         self.sentinel_idx = sentinel_idx
+        self.context_emb = nn.Embedding(num_contexts, dim)
         self.char_emb = nn.Embedding(vocab_size, dim)
-        self.output_emb = nn.Embedding(vocab_size, dim)
-        self.output_bias = nn.Parameter(torch.zeros(vocab_size))
-        self.register_buffer('pos_coeffs', torch.linspace(0.5, 1.5, context_len).view(1, context_len, 1))
-    def forward(self, x):
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        char_vecs = self.char_emb(x)
-        weighted = char_vecs * self.pos_coeffs
-        state = weighted.sum(dim=1)
-        state_norm = state / (state.norm(dim=1, keepdim=True) + 1e-8)
-        out_norm = self.output_emb.weight / (self.output_emb.weight.norm(dim=1, keepdim=True) + 1e-8)
-        logits = (state_norm @ out_norm.t()) * 10.0 + self.output_bias
+        self.char_bias = nn.Parameter(torch.zeros(vocab_size))
+    def forward(self, context_ids):
+        if context_ids.dim() == 0:
+            context_ids = context_ids.unsqueeze(0)
+        ctx_vec = self.context_emb(context_ids)
+        logits = ctx_vec @ self.char_emb.weight.t()
+        logits = logits + self.char_bias
         logits[:, self.sentinel_idx] = -1e9
         return logits
-    def predict_ordering(self, context_ids, idx_to_char):
+    def predict_ordering(self, context_id, idx_to_char):
         device = next(self.parameters()).device
-        x = torch.tensor(context_ids, dtype=torch.long, device=device)
+        x = torch.tensor([int(context_id)], dtype=torch.long, device=device)
         with torch.no_grad():
             logits = self.forward(x).squeeze(0)
             order = torch.argsort(logits, descending=True).tolist()
@@ -174,8 +159,21 @@ class CharOrderModel(nn.Module):
     def parameter_bytes(self):
         return sum(p.numel() for p in self.parameters()) * 4
     def runtime_bytes(self):
-        state_bytes = (self.char_emb.embedding_dim) * 4
-        return state_bytes
+        return self.context_emb.embedding_dim * 4
+
+def evaluate_loss(model, x, y, batch_size):
+    model.eval()
+    total_loss = 0.0
+    n = x.size(0)
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        for start in range(0, n, batch_size):
+            xb = x[start:start + batch_size].to(device)
+            yb = y[start:start + batch_size].to(device)
+            logits = model(xb)
+            loss = F.cross_entropy(logits, yb)
+            total_loss += loss.item() * xb.size(0)
+    return total_loss / max(n, 1)
 
 def train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, seed):
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -184,23 +182,25 @@ def train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, s
     best_val = math.inf
     n = train_x.size(0)
     rng = torch.Generator().manual_seed(seed)
+    device = next(model.parameters()).device
     for epoch in range(1, epochs + 1):
         model.train()
         perm = torch.randperm(n, generator=rng)
         total_loss = 0.0
         for start in range(0, n, batch_size):
             idx = perm[start:start + batch_size]
-            xb, yb = train_x[idx], train_y[idx]
+            xb = train_x[idx].to(device)
+            yb = train_y[idx].to(device)
             opt.zero_grad(set_to_none=True)
             logits = model(xb)
-            loss = expected_rank_loss(logits, yb, model.sentinel_idx)
+            loss = F.cross_entropy(logits, yb)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             total_loss += loss.item() * xb.size(0)
         scheduler.step()
         train_loss = total_loss / n
-        val_loss = evaluate_rank_loss(model, val_x, val_y, batch_size)
+        val_loss = evaluate_loss(model, val_x, val_y, batch_size)
         if val_loss < best_val:
             best_val = val_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -209,22 +209,12 @@ def train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, s
         model.load_state_dict(best_state)
     return model
 
-def evaluate_rank_loss(model, x, y, batch_size):
-    model.eval()
-    total_loss = 0.0
-    n = x.size(0)
-    with torch.no_grad():
-        for start in range(0, n, batch_size):
-            xb, yb = x[start:start + batch_size], y[start:start + batch_size]
-            logits = model(xb)
-            loss = expected_rank_loss(logits, yb, model.sentinel_idx)
-            total_loss += loss.item() * xb.size(0)
-    return total_loss / max(n, 1)
-
 def evaluate_rotations(model, x, y, idx_to_char, char_to_idx, batch_size):
-    valid_indices = [i for i in range(len(idx_to_char)) if i != char_to_idx[SENTINEL]]
-    valid_indices_t = torch.tensor(valid_indices, dtype=torch.long)
-    full_to_valid = torch.full((len(idx_to_char),), -1, dtype=torch.long)
+    sentinel_idx = char_to_idx[SENTINEL]
+    valid_indices = [i for i in range(len(idx_to_char)) if i != sentinel_idx]
+    device = next(model.parameters()).device
+    valid_indices_t = torch.tensor(valid_indices, dtype=torch.long, device=device)
+    full_to_valid = torch.full((len(idx_to_char),), -1, dtype=torch.long, device=device)
     for pos, idx in enumerate(valid_indices):
         full_to_valid[idx] = pos
     model.eval()
@@ -232,14 +222,15 @@ def evaluate_rotations(model, x, y, idx_to_char, char_to_idx, batch_size):
     n = x.size(0)
     with torch.no_grad():
         for start in range(0, n, batch_size):
-            xb, yb = x[start:start + batch_size], y[start:start + batch_size]
+            xb = x[start:start + batch_size].to(device)
+            yb = y[start:start + batch_size].to(device)
             logits = model(xb)
-            valid_logits = logits.index_select(1, valid_indices_t.to(logits.device))
+            valid_logits = logits.index_select(1, valid_indices_t)
             order = torch.argsort(valid_logits, dim=1, descending=True)
             positions = torch.empty_like(order)
-            ranks = torch.arange(order.size(1), device=order.device).unsqueeze(0).expand_as(order)
+            ranks = torch.arange(order.size(1), device=device).unsqueeze(0).expand_as(order)
             positions.scatter_(1, order, ranks)
-            target_cols = full_to_valid[yb].to(order.device)
+            target_cols = full_to_valid[yb]
             target_pos = positions.gather(1, target_cols.unsqueeze(1)).squeeze(1)
             total_cost += int(target_pos.sum().item())
     avg = total_cost / n if n else 0.0
@@ -252,6 +243,8 @@ def main():
     alphabet, char_to_idx, idx_to_char = build_vocab(stream)
     if len(alphabet) <= 2:
         raise ValueError("The input text does not contain enough characters after normalization.")
+    base = len(alphabet)
+    num_contexts = base ** context_len
     all_x, all_y = make_examples(stream, context_len, char_to_idx)
     train_x, train_y, val_x, val_y = split_examples(all_x, all_y, val_fraction, seed)
     global_order = build_global_freq(stream, alphabet)
@@ -260,22 +253,25 @@ def main():
     oracle_fn = make_oracle(counts, global_order, context_len)
     static_cost, static_chars, static_avg = simulate(stream, alphabet, static_fn, context_len)
     oracle_cost, oracle_chars, oracle_avg = simulate(stream, alphabet, oracle_fn, context_len)
-    print(f"Alphabet: {''.join(global_order)}")
+    print(f"Model device:        {device}")
+    print(f"Alphabet:            {''.join(global_order)}")
     print(f"Alphabet size:       {len(alphabet) - 1}")
     print(f"Context length:      {context_len}")
+    print(f"Contexts possible:   {num_contexts}")
     print(f"Dim:                 {dim}")
     print(f"Train examples:      {len(train_x)}")
     print(f"Validation examples: {len(val_x)}")
     print(f"Static baseline:     {static_avg:.4f} rotations/char")
     print(f"Oracle {context_len}-gram:       {oracle_avg:.4f} rotations/char")
-    model = CharOrderModel(len(alphabet), dim, context_len, char_to_idx[SENTINEL])
+    model = ContextFactorModel(num_contexts, dim, len(alphabet), char_to_idx[SENTINEL]).to(device)
     model = train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, seed)
     cost, chars, avg = evaluate_rotations(model, val_x, val_y, idx_to_char, char_to_idx, batch_size)
     print(f"\nVal rotations/char:  {avg:.4f}  (vs static {static_avg - avg:+.4f}, vs oracle {oracle_avg - avg:+.4f})")
     print(f"Flash bytes:         {model.parameter_bytes()}")
     print(f"Runtime bytes:       {model.runtime_bytes()}")
     sample_ctx = [idx_to_char[i.item()] for i in val_x[0]]
-    ordering = model.predict_ordering(val_x[0].tolist(), idx_to_char)
+    sample_id = int(val_x[0].item())
+    ordering = model.predict_ordering(sample_id, idx_to_char)
     print(f"\nSample context: {''.join(sample_ctx)}")
     print(f"Predictions: {''.join(ordering)}")
 

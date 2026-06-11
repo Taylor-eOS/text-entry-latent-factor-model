@@ -5,6 +5,10 @@ import torch.nn as nn
 from collections import defaultdict
 from utils import normalize, build_vocab, build_global_freq
 
+seed = 1
+random.seed(seed)
+torch.manual_seed(seed)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 text_path = "input.txt"
 context_len = 3
 dim = 8
@@ -12,10 +16,6 @@ epochs = 80
 batch_size = 128
 lr = 0.007
 val_fraction = 0.1
-seed = 1
-random.seed(seed)
-torch.manual_seed(seed)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def build_ngram_counts(stream, max_order):
     counts = {}
@@ -72,20 +72,25 @@ def simulate(stream, alphabet, reorder_fn, context_len):
 
 def make_examples(stream, context_len, char_to_idx):
     padded = [" "] * context_len + stream
+    context_to_idx = {}
+    idx_to_context = []
     x = []
     y = []
     for i in range(context_len, len(padded)):
         tgt = padded[i]
         if tgt not in char_to_idx:
             continue
-        ctx = padded[i - context_len:i]
-        if any(ch not in char_to_idx for ch in ctx):
-            continue
-        x.append([char_to_idx[ch] for ch in ctx])
+        ctx = "".join(padded[i - context_len:i])
+        ctx_idx = context_to_idx.get(ctx)
+        if ctx_idx is None:
+            ctx_idx = len(idx_to_context)
+            context_to_idx[ctx] = ctx_idx
+            idx_to_context.append(ctx)
+        x.append(ctx_idx)
         y.append(char_to_idx[tgt])
     if not x:
         raise ValueError("No training examples were created from the input text.")
-    return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+    return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long), idx_to_context
 
 def split_examples(x, y, val_fraction, seed):
     n = x.size(0)
@@ -98,20 +103,17 @@ def split_examples(x, y, val_fraction, seed):
     return x[train_idx], y[train_idx], x[val_idx], y[val_idx]
 
 class ContextFactorModel(nn.Module):
-    def __init__(self, vocab_size, dim, context_len):
+    def __init__(self, vocab_size, dim, context_vocab_size):
         super().__init__()
-        self.context_len = context_len
-        self.slot_embs = nn.ModuleList([nn.Embedding(vocab_size, dim) for _ in range(context_len)])
+        self.context_emb = nn.Embedding(context_vocab_size, dim)
         self.char_emb = nn.Embedding(vocab_size, dim)
         self.char_bias = nn.Parameter(torch.zeros(vocab_size))
     def forward(self, context_idxs):
-        ctx_vec = 0
-        for i in range(self.context_len):
-            ctx_vec = ctx_vec + self.slot_embs[i](context_idxs[:, i])
+        ctx_vec = self.context_emb(context_idxs)
         return ctx_vec @ self.char_emb.weight.t() + self.char_bias
-    def predict_ordering(self, context_idxs, idx_to_char):
+    def predict_ordering(self, context_idx, idx_to_char):
         device = next(self.parameters()).device
-        x = torch.tensor(context_idxs, dtype=torch.long, device=device).unsqueeze(0)
+        x = torch.tensor([context_idx], dtype=torch.long, device=device)
         with torch.no_grad():
             logits = self.forward(x).squeeze(0)
             order = torch.argsort(logits, descending=True).tolist()
@@ -200,7 +202,7 @@ def main():
     alphabet, char_to_idx, idx_to_char = build_vocab(stream)
     if len(alphabet) <= 1:
         raise ValueError("The input text does not contain enough characters after normalization.")
-    all_x, all_y = make_examples(stream, context_len, char_to_idx)
+    all_x, all_y, idx_to_context = make_examples(stream, context_len, char_to_idx)
     train_x, train_y, val_x, val_y = split_examples(all_x, all_y, val_fraction, seed)
     global_order = build_global_freq(stream, alphabet)
     counts = build_ngram_counts([" "] * context_len + stream, context_len)
@@ -208,25 +210,25 @@ def main():
     oracle_fn = make_oracle(counts, global_order, context_len)
     static_cost, static_chars, static_avg = simulate(stream, alphabet, static_fn, context_len)
     oracle_cost, oracle_chars, oracle_avg = simulate(stream, alphabet, oracle_fn, context_len)
-    print(f"Model device:        {device}")
-    print(f"Alphabet:            {''.join(global_order)}")
-    print(f"Alphabet size:       {len(alphabet)}")
+    print(f"Alphabet:       {len(alphabet)}")
+    print(f"Context tokens:  {len(idx_to_context)}")
+    print(f"{''.join(global_order)}")
     print(f"Context length:      {context_len}")
     print(f"Dim:                 {dim}")
     print(f"Train examples:      {len(train_x)}")
     print(f"Validation examples: {len(val_x)}")
     print(f"Static baseline:     {static_avg:.4f} rotations/char")
     print(f"Oracle {context_len}-gram:       {oracle_avg:.4f} rotations/char")
-    model = ContextFactorModel(len(alphabet), dim, context_len).to(device)
+    model = ContextFactorModel(len(alphabet), dim, len(idx_to_context)).to(device)
     model = train_model(model, train_x, train_y, val_x, val_y, epochs, batch_size, lr, seed)
     cost, chars, avg = evaluate_rotations(model, val_x, val_y, batch_size)
     print(f"\nVal rotations/char:  {avg:.4f}  (vs static {static_avg - avg:+.4f}, vs oracle {oracle_avg - avg:+.4f})")
     print(f"Flash bytes:         {model.parameter_bytes()}")
     print(f"Runtime bytes:       {model.runtime_bytes()}")
-    sample_ctx = [idx_to_char[i.item()] for i in val_x[0]]
-    sample_idxs = val_x[0].tolist()
-    ordering = model.predict_ordering(sample_idxs, idx_to_char)
-    print(f"\nSample context: {''.join(sample_ctx)}")
+    sample_ctx = idx_to_context[val_x[0].item()]
+    sample_idx = val_x[0].item()
+    ordering = model.predict_ordering(sample_idx, idx_to_char)
+    print(f"\nSample context: {sample_ctx}")
     print(f"Predictions: {''.join(ordering)}")
 
 if __name__ == "__main__":
